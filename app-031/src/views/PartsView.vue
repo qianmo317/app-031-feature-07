@@ -9,7 +9,8 @@ import {
   newPart,
   allStockTemplates
 } from '../lib/store'
-import { uid, parsePartText, parseEdges, money } from '../lib/format'
+import { uid, parsePartText, money } from '../lib/format'
+import type { PartParseResult, ParsedPartRow, PartParseIssue } from '../lib/format'
 import { toast } from '../lib/ui'
 import type { Board, EdgeSide, Part } from '../types'
 
@@ -20,8 +21,8 @@ const job = computed(() => getJob(route.params.id as string))
 
 const importOpen = ref(false)
 const importText = ref('')
-const importErr = ref<string[]>([])
 const importReplace = ref(false)
+const preview = ref<PartParseResult | null>(null)
 const running = ref(false)
 
 const grainLabel: Record<Part['grain'], string> = {
@@ -29,12 +30,32 @@ const grainLabel: Record<Part['grain'], string> = {
   width: '横纹',
   none: '无要求'
 }
+const edgeSideLabel: Record<EdgeSide, string> = {
+  top: '上',
+  bottom: '下',
+  left: '左',
+  right: '右'
+}
 const edgeDefs: { key: EdgeSide; label: string }[] = [
   { key: 'top', label: '上' },
   { key: 'bottom', label: '下' },
   { key: 'left', label: '左' },
   { key: 'right', label: '右' }
 ]
+
+function edgesLabel(sides: EdgeSide[]): string {
+  return sides.length ? sides.map((s) => edgeSideLabel[s]).join('') : '无'
+}
+function rowGrainLabel(r: ParsedPartRow): string {
+  return grainLabel[r.grain]
+}
+function sourceText(r: ParsedPartRow): string {
+  const lines = r.sourceLines
+  if (lines.length <= 1) return `第 ${lines[0]} 行`
+  return `第 ${lines.join('、')} 行（合并）`
+}
+const previewQty = computed(() => preview.value?.rows.reduce((a, r) => a + r.qty, 0) ?? 0)
+const previewIssues = computed<PartParseIssue[]>(() => preview.value?.issues ?? [])
 
 const totalPieces = computed(() => job.value?.parts.reduce((a, p) => a + (p.qty || 0), 0) ?? 0)
 const totalArea = computed(
@@ -134,24 +155,49 @@ const warnings = computed<string[]>(() => {
   return out
 })
 
-function doImport(): void {
-  if (!job.value) return
-  const { rows, errors } = parsePartText(importText.value)
-  importErr.value = errors
-  if (rows.length === 0) {
+function runParse(): void {
+  if (!importText.value.trim()) {
+    toast('请先粘贴清单内容', 'bad')
+    return
+  }
+  preview.value = parsePartText(importText.value)
+  if (preview.value.rows.length === 0 && preview.value.issues.length === 0) {
     toast('没有可导入的行', 'bad')
+  }
+}
+
+function backToEdit(): void {
+  preview.value = null
+}
+
+/** 整批退回：丢弃本次解析与粘贴内容 */
+function rejectImport(): void {
+  preview.value = null
+  importText.value = ''
+  importOpen.value = false
+}
+
+function closeImport(): void {
+  importOpen.value = false
+  preview.value = null
+}
+
+function confirmImport(): void {
+  if (!job.value || !preview.value) return
+  if (preview.value.issues.length > 0) {
+    toast('还有解析问题，请先退回修改', 'bad')
     return
   }
   const boardId = job.value.boards[0]?.id ?? ''
-  const built = rows.map((r) =>
+  const built = preview.value.rows.map((r) =>
     newPart({
       code: r.code || `P${Math.floor(Math.random() * 9000 + 1000)}`,
       name: r.name,
       lenMm: r.lenMm,
       widMm: r.widMm,
       qty: r.qty,
-      grain: r.grain as Part['grain'],
-      edgeBands: parseEdges(r.edges),
+      grain: r.grain,
+      edgeBands: r.edges,
       cabinet: r.cabinet,
       exposed: r.exposed,
       boardId
@@ -160,9 +206,17 @@ function doImport(): void {
   if (importReplace.value) job.value.parts = built
   else job.value.parts.push(...built)
   save()
-  toast(`已导入 ${built.length} 条`, 'good')
-  importOpen.value = false
-  importText.value = ''
+  const mergedQty = preview.value.mergedGroups.reduce(
+    (a, g) => a + g.lines.length - 1,
+    0
+  )
+  const mergeTxt = mergedQty > 0 ? `，合并重复件号 ${mergedQty} 行` : ''
+  const skipTxt =
+    preview.value.skippedBlankName.length > 0
+      ? `，跳过空名称行 ${preview.value.skippedBlankName.length} 行`
+      : ''
+  toast(`已导入 ${built.length} 种 / ${previewQty.value} 件${mergeTxt}${skipTxt}`, 'good')
+  rejectImport()
 }
 
 async function doNest(): Promise<void> {
@@ -186,9 +240,13 @@ async function doNest(): Promise<void> {
   }
 }
 
-const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
-门板\t2200\t450\t2\t竖纹\t上下左右\t衣柜\t是
-层板\t550\t560\t4\t无\t左右\t衣柜\t否`
+const sampleTsv = `卧室衣柜开料清单
+名称\t件号\t长度(cm)\t宽度(cm)\t数量\t纹理\t封边\t柜体\t见光
+\t\t厘米\t厘米\t件\t\t\t\t
+门板\tM01\t220\t45\t2\t竖纹\t上下左右\t衣柜\t是
+侧板\tC02\t216\t58\t2\t顺纹\t上左下右\t衣柜\t否
+侧板\tC02\t216\t58\t1\t顺纹\t134\t衣柜\t否
+层板\tB03\t55\t56\t4\t无\t左右\t衣柜\t否`
 </script>
 
 <template>
@@ -280,18 +338,98 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
       </div>
 
       <div v-if="importOpen" class="import-box">
-        <p class="small muted">
-          支持 Excel 直接粘贴（制表符分隔），列：名称/长/宽/数量/纹理(竖|横|无)/封边(上下左右)/柜体/见光(是)。
-          无表头时按「名称,长,宽,数量,纹理,封边,柜体,见光」顺序解析。
-        </p>
-        <textarea v-model="importText" rows="6" :placeholder="sampleTsv"></textarea>
-        <p v-for="(e, i) in importErr" :key="i" class="small" style="color: var(--c-bad)">{{ e }}</p>
-        <div class="row" style="margin-top: 6px">
-          <label class="row small"><input type="checkbox" v-model="importReplace" /> 替换当前清单</label>
-          <div class="spacer" />
-          <button class="sm" @click="importOpen = false">取消</button>
-          <button class="sm primary" @click="doImport">解析并导入</button>
-        </div>
+        <!-- 第一步：粘贴并解析 -->
+        <template v-if="!preview">
+          <p class="small muted">
+            支持 Excel 直接粘贴（制表符分隔，逗号/分号也行）。开头的合并标题行、单位行会自动跳过；
+            长宽按列单位（mm/厘米/cm/米）换算成毫米并按整数取整，单元格也可单独带单位；
+            封边认「上左下右」、T/B/L/R、1-4 及「一二三四」；纹理认 顺纹/竖纹、横纹、无（无要求）；
+            同一件号多行自动合并、数量相加；名称为空的行会跳过。解析后先出预览，确认无误才写入清单。
+          </p>
+          <textarea v-model="importText" rows="8" :placeholder="sampleTsv"></textarea>
+          <div class="row" style="margin-top: 6px">
+            <label class="row small"><input type="checkbox" v-model="importReplace" /> 替换当前清单（否则追加）</label>
+            <div class="spacer" />
+            <button class="sm" @click="closeImport">取消</button>
+            <button class="sm primary" @click="runParse">解析生成预览</button>
+          </div>
+        </template>
+
+        <!-- 第二步：预览确认 -->
+        <template v-else>
+          <div class="row wrap" style="gap: 8px; margin-bottom: 6px">
+            <strong style="font-size: 13px">导入预览</strong>
+            <span class="tag">{{ preview.rows.length }} 种 / {{ previewQty }} 件</span>
+            <span class="tag">解析数据行 {{ preview.dataLineCount }} 行</span>
+            <span v-if="preview.mergedGroups.length" class="tag">
+              合并重复件号 {{ preview.mergedGroups.length }} 组
+            </span>
+            <span v-if="preview.skippedPreamble" class="tag">
+              跳过开头标题/单位行 {{ preview.skippedPreamble }} 行
+            </span>
+            <span v-if="preview.skippedBlankName.length" class="tag" style="border-color: #d8a04c; color: #92600a">
+              跳过名称为空的行 {{ preview.skippedBlankName.length }} 行（第
+              {{ preview.skippedBlankName.map((s) => s.row).join('、') }} 行）
+            </span>
+            <div class="spacer" />
+            <label class="row small"><input type="checkbox" v-model="importReplace" /> 替换当前清单（否则追加）</label>
+          </div>
+
+          <div v-if="preview.mergedGroups.length" class="small muted" style="margin-bottom: 4px">
+            <template v-for="g in preview.mergedGroups" :key="g.code">
+              件号「{{ g.code }}」合并第 {{ g.lines.join('、') }} 行，数量合计 {{ g.qty }}；
+            </template>
+          </div>
+
+          <div v-if="previewIssues.length" class="import-issues">
+            <div v-for="(e, i) in previewIssues" :key="i" class="issue-item">
+              <div>
+                <strong>第 {{ e.row }} 行<template v-if="e.column"> · {{ e.column }}列</template>：</strong>{{ e.message }}
+              </div>
+              <div class="issue-raw">原样：{{ e.raw || '（空行）' }}</div>
+            </div>
+          </div>
+          <div v-else class="small" style="color: var(--c-good, #2a7d5f); margin-bottom: 4px">
+            ✓ 校验通过，无解析问题
+          </div>
+
+          <div v-if="preview.rows.length" class="table-scroll" style="max-height: 260px; margin-bottom: 6px">
+            <table class="grid parts-table">
+              <thead>
+                <tr>
+                  <th>来源</th><th>件号</th><th>名称</th><th>长(mm)</th><th>宽(mm)</th>
+                  <th>数量</th><th>纹理</th><th>封边</th><th>柜体</th><th>见光</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="r in preview.rows" :key="(r.code || 'x') + r.sourceLines[0]">
+                  <td class="small muted">{{ sourceText(r) }}</td>
+                  <td>{{ r.code || '—' }}</td>
+                  <td>{{ r.name }}</td>
+                  <td>{{ r.lenMm }}</td>
+                  <td>{{ r.widMm }}</td>
+                  <td>{{ r.qty }}</td>
+                  <td>{{ rowGrainLabel(r) }}</td>
+                  <td>{{ edgesLabel(r.edges) }}</td>
+                  <td>{{ r.cabinet }}</td>
+                  <td style="text-align: center">{{ r.exposed ? '是' : '否' }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="row" style="margin-top: 6px">
+            <span class="small muted" v-if="previewIssues.length">
+              存在 {{ previewIssues.length }} 个问题，无法写入；可退回修改粘贴内容后重新解析。
+            </span>
+            <div class="spacer" />
+            <button class="sm" @click="backToEdit">← 退回修改</button>
+            <button class="sm ghost-danger" @click="rejectImport">整批退回（清空）</button>
+            <button class="sm primary" :disabled="previewIssues.length > 0 || preview.rows.length === 0" @click="confirmImport">
+              确认写入清单
+            </button>
+          </div>
+        </template>
       </div>
 
       <div v-if="warnings.length > 0" class="warn-box">
@@ -393,6 +531,30 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
   padding: 10px;
   margin-bottom: 10px;
   background: #fafcf9;
+}
+.import-issues {
+  border: 1px solid #f3c9c9;
+  background: var(--c-bad-bg);
+  color: var(--c-bad);
+  border-radius: 6px;
+  padding: 6px 10px;
+  margin-bottom: 8px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.issue-item {
+  padding: 4px 0;
+  border-bottom: 1px dashed #eac5c5;
+  font-size: 12px;
+}
+.issue-item:last-child {
+  border-bottom: none;
+}
+.issue-raw {
+  color: var(--c-ink-2);
+  margin-top: 2px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  word-break: break-all;
 }
 .warn-box {
   border: 1px solid #f0d9b5;

@@ -5,6 +5,7 @@ import type { Board, Job, Part } from '../types'
 import { nestJob } from './packing'
 import { simulate, countSawOps } from './cuts'
 import { guillotineViolation, type Rect } from './geometry'
+import { parsePartText } from './format'
 
 export interface CheckResult {
   name: string
@@ -439,6 +440,64 @@ export function runSelfTest(): SelfTestReport {
       ok,
       `18mm 用 ${thickSheets} 张（库存 1，需补采）、9mm 用 ${thinSheets} 张`
     )
+  }
+
+  // 10) 批量粘贴解析：标题/单位行、厘米换算、封边三种写法、纹理同义说法、
+  //     同件号合并数量、空名称跳过、错误行列定位与原文带出
+  {
+    const tsv = [
+      '某卧室衣柜开料清单（2026-10）',
+      '名称\t件号\t长度(cm)\t宽度(cm)\t数量\t纹理\t封边\t柜体\t见光',
+      '\t\t厘米\t厘米\t件\t\t\t\t',
+      '门板\tM01\t220\t45\t2\t竖纹\t上左下右\t衣柜\t是',
+      '侧板\tC02\t216\t58\t2\t顺纹\tTBLR\t衣柜\t否',
+      '侧板\tC02\t216\t58\t1\t顺纹\t一二三四\t衣柜\t否',
+      '层板\tB03\t55\t56\t4\t无\t左右\t衣柜\t否',
+      '\tX9\t100\t100\t1\t无\t无\t衣柜\t否',
+      '坏件\tE01\t22x0\t45\t2\t斜纹\t5\t衣柜\t否'
+    ].join('\n')
+    const r = parsePartText(tsv)
+    const m01 = r.rows.find((x) => x.code === 'M01')
+    const c02 = r.rows.find((x) => x.code === 'C02')
+    const issueCols = r.issues.map((e) => `${e.row}:${e.column}`)
+    const ok =
+      r.skippedPreamble === 2 &&
+      r.rows.length === 3 &&
+      m01?.lenMm === 2200 &&
+      m01.widMm === 450 &&
+      c02?.qty === 3 &&
+      c02.sourceLines.length === 2 &&
+      r.mergedGroups.length === 1 &&
+      r.skippedBlankName.length === 1 &&
+      r.skippedBlankName[0].row === 8 &&
+      r.issues.length === 3 &&
+      issueCols.includes('9:长度(cm)') &&
+      issueCols.includes('9:纹理') &&
+      issueCols.includes('9:封边') &&
+      r.issues[0].raw.includes('22x0')
+    add(
+      '批量粘贴：标题/单位行跳过、厘米换算、封边三写法、纹理归一、同件号合并、空名称跳过、错误带行列与原文',
+      ok,
+      ok
+        ? '2 行前导跳过；cm→mm 正确；C02 合并为 3 件；第 8 行空名称跳过；第 9 行精确报出长/纹理/封边三列'
+        : `前导${r.skippedPreamble} 行/${r.rows.length} 条/问题 ${JSON.stringify(issueCols)}`
+    )
+  }
+
+  // 10b) 单元格自带单位按整数取整；数量只认正整数
+  {
+    const r = parsePartText('名称\t长\t宽\t数量\n层板\t55.3cm\t56.8cm\t0')
+    const qtyIssue = r.issues.find((e) => e.column === '数量')
+    const ok =
+      r.rows.length === 0 &&
+      !!qtyIssue &&
+      qtyIssue.row === 2 &&
+      qtyIssue.raw === '层板\t55.3cm\t56.8cm\t0'
+    // 数量为 0 本行整体不入结果；另验证纯换算取整
+    const r2 = parsePartText('名称\t长\t宽\n层板\t55.3cm\t56.8cm')
+    const ok2 = r2.rows[0].lenMm === 553 && r2.rows[0].widMm === 568
+    add('粘贴长宽按单元格单位换算并整数取整、非正整数数量报错且定位', ok && ok2,
+      ok && ok2 ? '55.3cm→553mm、56.8cm→568mm；数量 0 报在第 2 行数量列并带原文' : '换算或数量校验不符')
   }
 
   const elapsedMs = Math.round(performance.now() - t0)

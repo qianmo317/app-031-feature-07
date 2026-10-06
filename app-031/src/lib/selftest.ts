@@ -5,6 +5,7 @@ import type { Board, Job, Part } from '../types'
 import { nestJob } from './packing'
 import { simulate, countSawOps } from './cuts'
 import { guillotineViolation, type Rect } from './geometry'
+import { parsePartText, decodeEdges } from './format'
 
 export interface CheckResult {
   name: string
@@ -438,6 +439,117 @@ export function runSelfTest(): SelfTestReport {
       '多板种混排且 18mm 库存仅 1 张时超开并提示补采',
       ok,
       `18mm 用 ${thickSheets} 张（库存 1，需补采）、9mm 用 ${thinSheets} 张`
+    )
+  }
+
+  // 10) 批量粘贴解析：标题行/单位行、厘米换算、封边三写法、纹理归并、件号合数量、空名称跳过
+  {
+    const tsv = [
+      '万科3-1802 衣柜 BOM（单位：毫米）', // 合并标题行
+      '件号\t名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光',
+      '\t\tcm\tcm\t件\t\t\t\t', // 单位行
+      'A01\t门板\t220\t45\t2\t顺纹\t上左下右\t衣柜\t是',
+      'A02\t层板\t55\t56\t4\t无\t1,3\t衣柜\t否',
+      'A03\t侧板\t2100mm\t580mm\t1\t竖纹\tTBL\t衣柜\t是',
+      'A03\t侧板\t2100mm\t580mm\t1\t顺纹\t一二三\t衣柜\t是',
+      'A04\t背板\t180\t90\t2\t横纹\t四边\t衣柜\t否',
+      '误录\t\t100\t100\t1\t无\t无\t衣柜\t否（名称为空应跳过）'
+    ].join('\n')
+    const r = parsePartText(tsv)
+    const find = (code: string) => r.rows.find((x) => x.code === code)!
+    const a01 = find('A01')
+    const a03 = find('A03')
+    const ok =
+      r.errors.length === 0 &&
+      r.rows.length === 4 &&
+      r.headerLine === 2 &&
+      r.unitLine === 3 &&
+      // cm 列 ×10，四舍五入取整
+      a01.lenMm === 2200 && a01.widMm === 450 &&
+      find('A02').lenMm === 550 &&
+      // 单元格 mm 覆盖列单位
+      a03.lenMm === 2100 && a03.widMm === 580 &&
+      // 封边中文/英文/数字/四边
+      a01.edgeBands.join(',') === 'top,left,bottom,right' &&
+      find('A02').edgeBands.join(',') === 'top,left' &&
+      a03.edgeBands.join(',') === 'top,bottom,left' &&
+      find('A04').edgeBands.length === 4 &&
+      // 顺纹归竖纹；横纹归 width
+      a01.grain === 'length' &&
+      find('A02').grain === 'none' &&
+      find('A04').grain === 'width' &&
+      // 同件号合并、数量相加（两行 TBL / 一二三 同集）
+      a03.qty === 2 && a03.mergedQty === 2 && a03.sourceLines.join(',') === '6,7' &&
+      // 空名称行跳过并计数
+      r.notices.some((n) => n.message.includes('名称为空共跳过 1 行'))
+    add(
+      '粘贴导入：跳标题/单位行、cm换算取整、封边三写法、纹理归并、件号合数量、空名称跳过',
+      ok,
+      ok
+        ? `解析 ${r.rows.length} 条；A03 合并后数量 ${a03.qty}；标题行 ${r.headerLine}、单位行 ${r.unitLine}`
+        : `错误：${r.errors.map((e) => e.message).join('；') || '断言不符'}`
+    )
+  }
+
+  // 11) 解析错误精确到行、列并带原文；数量只认正整数；无表头固定列序
+  {
+    const tsv = [
+      '门板\t2200\t450\t2\t竖纹\tTB', // 无表头：名称在第 1 列
+      '层板\t550\t560\t2.5\t无\t左右', // 第 2 行数量非正整数
+      '侧板\tabc\t580\t1\t乱纹\t5\t衣柜\t否' // 第 3 行长无效、纹理无法识别、封边数字越界
+    ].join('\n')
+    const r = parsePartText(tsv)
+    const eQty = r.errors.find((e) => e.line === 2 && e.col === 4)
+    const eLen = r.errors.find((e) => e.line === 3 && e.col === 2)
+    const eGrain = r.errors.find((e) => e.line === 3 && e.col === 5)
+    const eEdge = r.errors.find((e) => e.line === 3 && e.col === 6)
+    const ok =
+      r.headerLine === 0 &&
+      r.rows.length === 1 &&
+      r.rows[0].name === '门板' &&
+      r.rows[0].lenMm === 2200 &&
+      decodeEdges('tb').sides.join(',') === 'top,bottom' &&
+      !!eQty && eQty.message.includes('正整数') &&
+      !!eLen && eLen.message.includes('(第2列)') && eLen.raw.includes('abc') &&
+      !!eGrain && eGrain.message.includes('纹理') && eGrain.raw.includes('乱纹') &&
+      !!eEdge && eEdge.message.includes('封边') && eEdge.raw.includes('侧板')
+    add(
+      '粘贴导入：错误精确到第几行第几列并带原文；无表头固定列序；数量仅正整数',
+      ok,
+      ok
+        ? `错误 ${r.errors.length} 处均带行列与原文，正常行不受影响`
+        : `错误：${r.errors.map((e) => e.message).join('；') || '断言不符'}`
+    )
+  }
+
+  // 12) 封边解码器：中文/英文缩写/数字（含紧凑连写）与非法片段
+  {
+    const cases: [string, string][] = [
+      ['上下左右', 'top,bottom,left,right'],
+      ['上左下右', 'top,left,bottom,right'],
+      ['tb', 'top,bottom'],
+      ['TBLR', 'top,bottom,left,right'],
+      ['1234', 'top,bottom,left,right'],
+      ['一二三四', 'top,bottom,left,right'],
+      ['1,3', 'top,left'],
+      ['顶底', 'top,bottom'],
+      ['无', ''],
+      ['0', '']
+    ]
+    const allOk = cases.every(([input, want]) => decodeEdges(input).sides.join(',') === want)
+    const bad1 = decodeEdges('上5')
+    const bad2 = decodeEdges('TBLX')
+    const ok =
+      allOk && bad1.invalid.join('') === '5' && bad2.invalid.join('') === 'x'
+    add(
+      '封边解码：中文/英文缩写/数字三写法（含紧凑连写）且非法片段可报错',
+      ok,
+      ok
+        ? '10 组写法全部一致，非法片段：「上5」→5、「TBLX」→x'
+        : `失败样例：${cases
+            .filter(([i]) => decodeEdges(i).sides.join(',') !== cases.find(([x]) => x === i)?.[1])
+            .map(([i]) => i)
+            .join('、')}`
     )
   }
 
